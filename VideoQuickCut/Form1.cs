@@ -59,9 +59,9 @@ namespace VideoQuickCut
                     psi.FileName = "powershell.exe";
                     psi.Arguments =
                         "-NoProfile -NonInteractive -Command " +
-                        "\"Get-CimInstance Win32_VideoController | " +
-                        "Where-Object {$_.Name -like '*NVIDIA*'} | " +
-                        "Select-Object -ExpandProperty Name\"";
+                        "\"$gpu = Get-CimInstance Win32_VideoController | " +
+                        "Where-Object { $_.Name -match 'NVIDIA' }; " +
+                        "if ($gpu) { $gpu.Name }\"";
 
                     psi.UseShellExecute = false;
                     psi.RedirectStandardOutput = true;
@@ -73,16 +73,10 @@ namespace VideoQuickCut
                         process.StartInfo = psi;
                         process.Start();
 
-                        Task<string> outputTask =
-                            process.StandardOutput.ReadToEndAsync();
-
-                        Task<string> errorTask =
-                            process.StandardError.ReadToEndAsync();
+                        string output =
+                            process.StandardOutput.ReadToEnd();
 
                         process.WaitForExit();
-
-                        string output = outputTask.Result;
-                        string error = errorTask.Result;
 
                         if (process.ExitCode != 0)
                             return "";
@@ -301,7 +295,6 @@ namespace VideoQuickCut
             {
                 txtInputVideo.Text = openFileDialog1.FileName;
 
-                // Set output folder to the input video's directory.
                 string inputFolder =
                     Path.GetDirectoryName(openFileDialog1.FileName);
 
@@ -359,6 +352,59 @@ namespace VideoQuickCut
 
         private async void btnProcess_Click(object sender, EventArgs e)
         {
+            // =========================================
+            // GPU SELECTION - ASK IMMEDIATELY ON CLICK
+            // =========================================
+
+            bool useGpu = false;
+
+            DialogResult gpuChoice = MessageBox.Show(
+                "Do you want to use NVIDIA GPU encoding?",
+                "Encoding Selection",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question
+            );
+
+            if (gpuChoice == DialogResult.Yes)
+            {
+                string gpuName = await DetectNvidiaGpuAsync();
+
+                if (string.IsNullOrWhiteSpace(gpuName))
+                {
+                    MessageBox.Show(
+                        "No NVIDIA GPU was detected. CPU encoding will be used.",
+                        "GPU Detection",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information
+                    );
+                }
+                else
+                {
+                    bool nvencAvailable = await IsNvencAvailableAsync();
+
+                    if (nvencAvailable)
+                    {
+                        useGpu = true;
+                        LogMessage("NVIDIA GPU: " + gpuName);
+                        LogMessage("Using NVIDIA NVENC encoding.");
+                    }
+                    else
+                    {
+                        MessageBox.Show(
+                            "NVIDIA GPU detected, but FFmpeg NVENC is unavailable. CPU encoding will be used."
+                        );
+                    }
+                }
+            }
+            else
+            {
+                LogMessage("Using CPU encoding.");
+            }
+
+            // =========================================
+            // INPUT VALIDATION
+            // =========================================
+
             string inputVideo = txtInputVideo.Text.Trim();
             string imagePath = txtReplacementImage.Text.Trim();
             string outputFolder = txtOutputVideo.Text.Trim();
@@ -432,103 +478,24 @@ namespace VideoQuickCut
                     return;
             }
 
-            // -----------------------------------------
-            // NVIDIA GPU DETECTION AND USER CONFIRMATION
-            // -----------------------------------------
-
-            bool useGpu = false;
-
-            if (gpuVideoCodec != null)
+            // Only use GPU if this format has an NVENC codec.
+            if (useGpu && gpuVideoCodec == null)
             {
-                LogMessage("Checking for NVIDIA GPU hardware...");
-
-                string gpuName = await DetectNvidiaGpuAsync();
-
-                if (!string.IsNullOrEmpty(gpuName))
-                {
-                    LogMessage(
-                        "NVIDIA GPU detected: " + gpuName);
-
-                    DialogResult gpuConfirmation =
-                        MessageBox.Show(
-                            "An NVIDIA GPU was detected:\r\n\r\n" +
-                            gpuName + "\r\n\r\n" +
-                            "Do you want to use NVIDIA GPU " +
-                            "acceleration (NVENC)?",
-                            "NVIDIA GPU Detected",
-                            MessageBoxButtons.YesNo,
-                            MessageBoxIcon.Question);
-
-                    if (gpuConfirmation == DialogResult.Yes)
-                    {
-                        LogMessage(
-                            "Checking FFmpeg NVENC availability...");
-
-                        useGpu = await IsNvencAvailableAsync();
-
-                        if (!useGpu)
-                        {
-                            MessageBox.Show(
-                                "NVIDIA GPU was detected, but FFmpeg " +
-                                "NVENC encoding is unavailable.\r\n\r\n" +
-                                "Please check your NVIDIA drivers and " +
-                                "FFmpeg build.",
-                                "NVENC Unavailable",
-                                MessageBoxButtons.OK,
-                                MessageBoxIcon.Warning);
-                        }
-                    }
-                    else
-                    {
-                        LogMessage(
-                            "User declined NVIDIA GPU encoding.");
-                    }
-                }
-                else
-                {
-                    LogMessage("No NVIDIA GPU detected.");
-                }
-            }
-
-            // -----------------------------------------
-            // CPU FALLBACK
-            // -----------------------------------------
-
-            if (!useGpu)
-            {
-                DialogResult result = MessageBox.Show(
-                    "NVIDIA GPU acceleration will not be used.\r\n\r\n" +
-                    "Do you want to continue using CPU encoding?",
-                    "CPU Encoding",
-                    MessageBoxButtons.OKCancel,
-                    MessageBoxIcon.Question);
-
-                if (result == DialogResult.Cancel)
-                {
-                    LogMessage(
-                        "Processing cancelled by user.");
-
-                    return;
-                }
-
-                LogMessage("Using CPU encoding.");
-            }
-            else
-            {
+                useGpu = false;
                 LogMessage(
-                    "User confirmed NVIDIA GPU acceleration.");
-
-                LogMessage(
-                    "NVENC is available. Using GPU encoding.");
+                    "GPU encoding is not configured for this format. Using CPU.");
             }
 
-            string videoCodec = useGpu
-                ? gpuVideoCodec
-                : cpuVideoCodec;
+            string videoCodec =
+                useGpu ? gpuVideoCodec : cpuVideoCodec;
 
-            // -----------------------------------------
+            LogMessage(
+                useGpu ? "Using NVIDIA NVENC encoding." :
+                         "Using CPU encoding.");
+
+            // =========================================
             // OUTPUT FILE
-            // -----------------------------------------
+            // =========================================
 
             string outputPath = Path.Combine(
                 outputFolder,
@@ -569,9 +536,9 @@ namespace VideoQuickCut
                 LogMessage("Output: " + outputPath);
                 LogMessage("Video codec: " + videoCodec);
 
-                // -----------------------------------------
+                // =========================================
                 // PROBE VIDEO DURATION
-                // -----------------------------------------
+                // =========================================
 
                 ProcessStartInfo probe = new ProcessStartInfo();
 
@@ -628,9 +595,9 @@ namespace VideoQuickCut
                     "Video duration: " +
                     TimeSpan.FromSeconds(duration).ToString());
 
-                // -----------------------------------------
+                // =========================================
                 // PROBE VIDEO RESOLUTION
-                // -----------------------------------------
+                // =========================================
 
                 ProcessStartInfo resolutionProbe =
                     new ProcessStartInfo();
@@ -711,14 +678,13 @@ namespace VideoQuickCut
                     "Video resolution: " +
                     videoWidth + "x" + videoHeight);
 
-                // -----------------------------------------
+                // =========================================
                 // VALIDATE INTERVALS
-                // -----------------------------------------
+                // =========================================
 
                 List<VideoInterval> intervals =
                     GetIntervals(duration);
 
-                // Build one enable expression covering all intervals.
                 StringBuilder enableExpression =
                     new StringBuilder();
 
@@ -741,9 +707,9 @@ namespace VideoQuickCut
 
                 string enable = enableExpression.ToString();
 
-                // -----------------------------------------
+                // =========================================
                 // VIDEO AND AUDIO FILTERS
-                // -----------------------------------------
+                // =========================================
 
                 string videoFilter =
                     "[1:v]scale=" + videoWidth + ":" + videoHeight +
@@ -754,9 +720,9 @@ namespace VideoQuickCut
                 string audioFilter =
                     "volume=volume=0:enable='" + enable + "'";
 
-                // -----------------------------------------
+                // =========================================
                 // BUILD FFMPEG ARGUMENTS
-                // -----------------------------------------
+                // =========================================
 
                 ProcessStartInfo ffmpeg =
                     new ProcessStartInfo();
@@ -784,24 +750,20 @@ namespace VideoQuickCut
 
                 arguments.Append("-c:v " + videoCodec + " ");
 
-                // NVIDIA GPU encoding.
                 if (videoCodec == "h264_nvenc")
                 {
                     arguments.Append(
                         "-preset p5 -rc vbr -cq 20 -b:v 0 ");
                 }
-                // CPU H.264 encoding.
                 else if (videoCodec == "libx264")
                 {
                     arguments.Append(
                         "-preset medium -crf 20 ");
                 }
-                // AVI encoding.
                 else if (videoCodec == "mpeg4")
                 {
                     arguments.Append("-q:v 3 ");
                 }
-                // WebM encoding.
                 else if (videoCodec == "libvpx-vp9")
                 {
                     arguments.Append("-crf 30 -b:v 0 ");
@@ -815,7 +777,6 @@ namespace VideoQuickCut
                     duration.ToString(
                         CultureInfo.InvariantCulture) + " ");
 
-                // faststart is intended for MP4/MOV-style containers.
                 string lowerExtension =
                     extension.ToLowerInvariant();
 
@@ -832,9 +793,9 @@ namespace VideoQuickCut
 
                 ffmpeg.Arguments = arguments.ToString();
 
-                // -----------------------------------------
+                // =========================================
                 // LOG INTERVALS
-                // -----------------------------------------
+                // =========================================
 
                 LogMessage(
                     "Intervals: " + intervals.Count);
@@ -850,9 +811,9 @@ namespace VideoQuickCut
 
                 LogMessage("Starting FFmpeg...");
 
-                // -----------------------------------------
+                // =========================================
                 // RUN FFMPEG
-                // -----------------------------------------
+                // =========================================
 
                 using (Process process = new Process())
                 {
@@ -887,7 +848,6 @@ namespace VideoQuickCut
                                 }
                                 catch (InvalidOperationException)
                                 {
-                                    // Form may be closing.
                                 }
                             }
                         }
@@ -899,7 +859,6 @@ namespace VideoQuickCut
                             }
                             catch (InvalidOperationException)
                             {
-                                // Form may be closing.
                             }
                         }
                     };
@@ -914,7 +873,6 @@ namespace VideoQuickCut
                             }
                             catch (InvalidOperationException)
                             {
-                                // Form may be closing.
                             }
                         }
                     };
@@ -927,7 +885,6 @@ namespace VideoQuickCut
                     await Task.Run(
                         () => process.WaitForExit());
 
-                    // Wait for asynchronous output events to finish.
                     process.WaitForExit();
 
                     if (process.ExitCode == 0 &&
